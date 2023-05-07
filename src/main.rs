@@ -1,6 +1,6 @@
 use tokio::net::TcpListener;
 
-use server_list_ping::connection::Connection;
+use minecraft_protocol::connection::Connection;
 
 const ADDRESS: &str = "0.0.0.0:25565";
 
