@@ -2,7 +2,6 @@ use anyhow::{anyhow, Result};
 use serde_json::Value;
 use uuid::Uuid;
 
-// TODO: maybe move to protocol.rs?
 pub struct Reader<'a> {
     bytes: &'a [u8],
     index: usize,
