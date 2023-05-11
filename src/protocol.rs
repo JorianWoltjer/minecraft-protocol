@@ -1,6 +1,12 @@
 use anyhow::{anyhow, Result};
+use mojang_api::{ProfileProperty, ServerAuthResponse};
+use openssl::rsa::Padding;
 use serde_json::Value;
 use uuid::Uuid;
+
+use crate::RSA_KEY_PAIR;
+
+// TODO: clear difference between clientbound and serverbound packets
 
 pub struct Reader<'a> {
     bytes: &'a [u8],
@@ -34,6 +40,13 @@ impl Reader<'_> {
         let string = String::from_utf8(self.bytes[self.index..self.index + length].to_vec())?;
         self.index += length;
         Ok(string)
+    }
+
+    pub fn read_byte_array(&mut self) -> Result<Vec<u8>> {
+        let length = self.read_varint()? as usize;
+        let array = self.bytes[self.index..self.index + length].to_vec();
+        self.index += length;
+        Ok(array)
     }
 
     pub fn read_bool(&mut self) -> Result<bool> {
@@ -92,11 +105,19 @@ impl Writer {
         self.bytes.extend_from_slice(string.as_bytes());
     }
 
+    pub fn write_uuid(&mut self, uuid: &Uuid) {
+        self.bytes.extend_from_slice(uuid.as_bytes());
+    }
+
     pub fn write_u16(&mut self, value: u16) {
         self.bytes.extend_from_slice(&value.to_be_bytes());
     }
     pub fn write_i64(&mut self, value: i64) {
         self.bytes.extend_from_slice(&value.to_be_bytes());
+    }
+
+    pub fn write_bool(&mut self, value: bool) {
+        self.bytes.push(value as u8);
     }
 
     pub fn write_raw(&mut self, bytes: &[u8]) {
@@ -239,6 +260,99 @@ impl TryFrom<Vec<u8>> for LoginStart {
 }
 
 #[derive(Debug)]
+pub struct EncryptionRequest {
+    pub server_id: String,
+    pub public_key: Vec<u8>,
+    pub verify_token: [u8; 4],
+}
+impl EncryptionRequest {
+    pub fn new(public_key: Vec<u8>, verify_token: [u8; 4]) -> EncryptionRequest {
+        EncryptionRequest {
+            server_id: String::from(""),
+            public_key,
+            verify_token,
+        }
+    }
+}
+impl TryInto<Vec<u8>> for EncryptionRequest {
+    type Error = anyhow::Error;
+
+    fn try_into(self) -> Result<Vec<u8>, Self::Error> {
+        let mut writer = Writer::new();
+        writer.write_string(&self.server_id);
+        writer.write_varint(self.public_key.len() as i32);
+        writer.write_raw(&self.public_key);
+        writer.write_varint(self.verify_token.len() as i32);
+        writer.write_raw(&self.verify_token);
+        Ok(writer.into())
+    }
+}
+
+#[derive(Debug)]
+pub struct EncryptionResponse {
+    pub shared_secret: Vec<u8>,
+    pub verify_token: Vec<u8>,
+}
+impl TryFrom<Vec<u8>> for EncryptionResponse {
+    type Error = anyhow::Error;
+
+    fn try_from(bytes: Vec<u8>) -> Result<Self, Self::Error> {
+        let mut cursor = Reader::new(&bytes);
+        let shared_secret = cursor.read_byte_array()?;
+        let verify_token = cursor.read_byte_array()?;
+
+        Ok(EncryptionResponse {
+            shared_secret,
+            verify_token,
+        })
+    }
+}
+impl EncryptionResponse {
+    pub fn decrypt_shared_secret(&self) -> Result<[u8; 16], anyhow::Error> {
+        let mut shared_secret = [0; 128];
+        RSA_KEY_PAIR.private_decrypt(&self.shared_secret, &mut shared_secret, Padding::PKCS1)?;
+        Ok(shared_secret[..16].try_into()?)
+    }
+
+    pub fn decrypt_verify_token(&self) -> Result<[u8; 4], anyhow::Error> {
+        let mut verify_token = [0; 128];
+        RSA_KEY_PAIR.private_decrypt(&self.verify_token, &mut verify_token, Padding::PKCS1)?;
+        Ok(verify_token[..4].try_into()?)
+    }
+}
+
+#[derive(Debug)]
+pub struct LoginSuccess {
+    pub uuid: Uuid,
+    pub username: String,
+    pub properties: Vec<ProfileProperty>,
+}
+impl From<ServerAuthResponse> for LoginSuccess {
+    fn from(server_auth_response: ServerAuthResponse) -> Self {
+        LoginSuccess {
+            uuid: Uuid::from_bytes(*server_auth_response.id.as_bytes()),
+            username: server_auth_response.name,
+            properties: server_auth_response.properties,
+        }
+    }
+}
+impl From<LoginSuccess> for Vec<u8> {
+    fn from(login_success: LoginSuccess) -> Self {
+        let mut writer = Writer::new();
+        writer.write_uuid(&login_success.uuid);
+        writer.write_string(&login_success.username);
+        writer.write_varint(login_success.properties.len() as i32);
+        for property in login_success.properties {
+            writer.write_string(&property.name);
+            writer.write_string(&property.value);
+            writer.write_bool(true);
+            writer.write_string(&property.signature);
+        }
+        writer.into()
+    }
+}
+
+#[derive(Debug)]
 pub struct LoginDisconnect {
     pub reason: Value,
 }
@@ -265,5 +379,6 @@ pub enum ConnectionState {
     Handshaking,
     Status,
     Login,
+    Play,
     Done,
 }

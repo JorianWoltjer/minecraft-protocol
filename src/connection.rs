@@ -1,14 +1,27 @@
+use aes::{
+    cipher::{AsyncStreamCipher, NewCipher},
+    Aes128,
+};
 use anyhow::{anyhow, Result};
+use cfb8::Cfb8;
+use mojang_api::ServerAuthResponse;
+use rand::{RngCore, SeedableRng};
 use serde_json::json;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
 };
 
-use crate::protocol::{
-    ConnectionState, Handshake, LoginDisconnect, LoginStart, Reader, StatusPing, StatusPong,
-    StatusRequest, StatusResponse, Writer,
+use crate::{
+    player::Player,
+    protocol::{
+        ConnectionState, EncryptionRequest, EncryptionResponse, Handshake, LoginStart,
+        LoginSuccess, Reader, StatusPing, StatusPong, StatusRequest, StatusResponse, Writer,
+    },
+    RSA_KEY_PAIR,
 };
+
+type AesCfb8 = Cfb8<Aes128>;
 
 #[derive(Debug)]
 pub struct Packet {
@@ -39,12 +52,24 @@ impl From<Packet> for Vec<u8> {
 pub struct Connection {
     stream: TcpStream,
     state: ConnectionState,
+    player: Option<Player>,
+    verify_token: [u8; 4],
+    shared_secret: Option<[u8; 16]>,
+    cipher: Option<AesCfb8>,
 }
 impl Connection {
     pub async fn new(stream: TcpStream) -> Self {
+        let mut rng = rand::rngs::StdRng::from_entropy();
+        let mut verify_token = [0; 4];
+        rng.fill_bytes(&mut verify_token);
+
         Connection {
             stream,
             state: ConnectionState::Handshaking,
+            player: None,
+            verify_token,
+            shared_secret: None,
+            cipher: None,
         }
     }
 
@@ -69,7 +94,13 @@ impl Connection {
         let size = self.read_varint().await?;
         let mut buffer = vec![0; size];
         self.stream.read_exact(&mut buffer).await?;
-        Packet::try_from(buffer)
+
+        let buffer = &mut buffer[..];
+        if let Some(cipher) = &mut self.cipher {
+            cipher.decrypt(buffer);
+        }
+
+        Packet::try_from(buffer.to_vec())
     }
 
     async fn write_packet(&mut self, packet: Packet) -> Result<()> {
@@ -81,7 +112,12 @@ impl Connection {
         writer2.write_varint(writer.len() as i32);
         writer2.write_raw(Vec::from(writer).as_slice());
 
-        self.stream.write_all(Vec::from(writer2).as_slice()).await?;
+        let buffer = &mut Vec::from(writer2)[..];
+        if let Some(cipher) = &mut self.cipher {
+            cipher.encrypt(buffer);
+        }
+
+        self.stream.write_all(buffer).await?;
         Ok(())
     }
 
@@ -91,6 +127,7 @@ impl Connection {
                 ConnectionState::Handshaking => self.handle_handshaking().await?,
                 ConnectionState::Status => self.handle_status().await?,
                 ConnectionState::Login => self.handle_login().await?,
+                ConnectionState::Play => self.handle_play().await?,
                 ConnectionState::Done => return Ok(()),
             }
         }
@@ -172,7 +209,6 @@ impl Connection {
         self.write_packet(packet).await?;
 
         self.state = ConnectionState::Done;
-
         Ok(())
     }
 
@@ -184,7 +220,10 @@ impl Connection {
                 self.handle_login_start(LoginStart::try_from(packet.data)?)
                     .await?
             }
-            0x01 => unimplemented!("Encryption Response"),
+            0x01 => {
+                self.handle_encryption_response(EncryptionResponse::try_from(packet.data)?)
+                    .await?
+            }
             0x02 => unimplemented!("Login Plugin Response"),
             _ => return Err(anyhow!("Invalid packet id")),
         };
@@ -194,17 +233,82 @@ impl Connection {
     async fn handle_login_start(&mut self, login_start: LoginStart) -> Result<()> {
         println!("< {login_start:?}");
 
-        let message = format!("Goodbye, {}!", login_start.username);
-        let response = LoginDisconnect::new(json!({ "text": message }));
+        self.player = Some(login_start.into());
+        println!("{:?}", self.player);
+
+        let response = EncryptionRequest::new(RSA_KEY_PAIR.public_key_to_der()?, self.verify_token);
         println!("> {response:?}");
 
         let packet = Packet {
-            id: 0x00,
+            id: 0x01,
             data: response.try_into()?,
         };
         self.write_packet(packet).await?;
 
-        self.state = ConnectionState::Done;
+        Ok(())
+    }
+
+    async fn authenticate_player(&mut self) -> Result<ServerAuthResponse> {
+        let player = self.player.clone().unwrap();
+        let username = player.username.clone();
+        let server_hash = mojang_api::server_hash(
+            "",
+            self.shared_secret.ok_or(anyhow!("Missing shared secret"))?,
+            &RSA_KEY_PAIR.public_key_to_der()?,
+        );
+
+        let client = reqwest::Client::new();
+        let string = client
+            .get("https://sessionserver.mojang.com/session/minecraft/hasJoined")
+            .query(&[("username", username), ("serverId", server_hash)])
+            .send()
+            .await?
+            .text()
+            .await?;
+
+        let response = serde_json::from_str(&string)?;
+
+        Ok(response)
+    }
+
+    async fn handle_encryption_response(
+        &mut self,
+        encryption_response: EncryptionResponse,
+    ) -> Result<()> {
+        println!("< {encryption_response:?}");
+
+        if encryption_response.decrypt_verify_token()? != self.verify_token {
+            return Err(anyhow!("Invalid verify token"));
+        }
+
+        let shared_secret = encryption_response.decrypt_shared_secret()?;
+
+        self.shared_secret = Some(shared_secret);
+        self.cipher = Some(AesCfb8::new_from_slices(&shared_secret, &shared_secret).unwrap());
+
+        let auth_response = self.authenticate_player().await?;
+        println!("{auth_response:?}");
+
+        let response: LoginSuccess = auth_response.into();
+        println!("> {response:?}");
+
+        let packet = Packet {
+            id: 0x02,
+            data: response.try_into()?,
+        };
+        self.write_packet(packet).await?;
+
+        self.state = ConnectionState::Play;
+
+        // TODO: send a valid Login (play) packet here
+
+        Ok(())
+    }
+
+    async fn handle_play(&mut self) -> Result<()> {
+        let packet = self.read_packet().await?;
+
+        println!("{packet:?}");
 
         Ok(())
     }
